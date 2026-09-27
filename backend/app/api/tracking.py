@@ -45,7 +45,7 @@ async def start_tracking(product_name: str, frequency_minutes: int = 360, db: As
     await db.commit()
     return {
         "status": "tracking_started",
-        "product_id": product_id,
+        "product_name": product_name,
         "jobs_created_or_updated": len(listings),
         "frequency_minutes": frequency_minutes,
         "message": "Tracking will begin in the next cycle"

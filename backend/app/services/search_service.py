@@ -122,7 +122,11 @@ class SearchOrchestrator:
 
             # Step 9: Persist to database if not in demo mode
             if not settings.is_demo_mode and current_prices:
-                asyncio.create_task(self._save_observations_to_db(product, current_prices))
+                try:
+                    await self._save_observations_to_db(product, current_prices)
+                except Exception as db_e:
+                    logger.error(f"Failed to persist observations: {db_e}", exc_info=True)
+                    warnings.append("Data persistence failed. Results may not be saved for tracking.")
 
             response = SearchResponse(
                 query=request.query,
@@ -155,26 +159,37 @@ class SearchOrchestrator:
         results: List[SearchResultItem],
         parsed_query: ParsedQuery
     ) -> List[SearchResultItem]:
-        """Filter search results to relevant product pages."""
+        """Filter search results to relevant product pages in parallel."""
+        # Clean up URLs to avoid exact duplicates
+        unique_results = []
+        seen_urls = set()
+        for r in results:
+            url = r.url.split("?")[0] if "?" in r.url and "amazon" not in r.url else r.url
+            if url not in seen_urls:
+                seen_urls.add(url)
+                unique_results.append(r)
+
+        # Parallelize classification
+        async def classify_and_filter(result: SearchResultItem) -> Optional[SearchResultItem]:
+            try:
+                classification = await llm_service.classify_search_result(
+                    result.title, result.url, result.snippet or ""
+                )
+                if classification.get("is_ecommerce") and classification.get("type") == "product_page":
+                    result.is_product_page = True
+                    result.relevance_score = classification.get("confidence", 0.5)
+                    return result
+            except Exception as e:
+                logger.warning(f"Classification failed for {result.url}: {e}")
+            return None
+
+        tasks = [classify_and_filter(r) for r in unique_results]
+        classified = await asyncio.gather(*tasks, return_exceptions=True)
+        
         filtered = []
-        seen_domains = set()
-
-        for result in results:
-            # Skip duplicate domains (keep first/best)
-            domain = result.domain.replace("www.", "")
-            if domain in seen_domains:
-                continue
-
-            # Classify the result
-            classification = await llm_service.classify_search_result(
-                result.title, result.url, result.snippet or ""
-            )
-
-            if classification.get("is_ecommerce") and classification.get("type") == "product_page":
-                result.is_product_page = True
-                result.relevance_score = classification.get("confidence", 0.5)
-                filtered.append(result)
-                seen_domains.add(domain)
+        for r in classified:
+            if isinstance(r, SearchResultItem):
+                filtered.append(r)
 
         return filtered
 
@@ -324,8 +339,30 @@ class SearchOrchestrator:
 
     def _build_product_info(self, parsed: ParsedQuery, original_query: str) -> ProductInfo:
         """Build canonical product info from parsed query."""
+        # Build a robust canonical name instead of using raw search query
+        components = []
+        if parsed.brand:
+            components.append(parsed.brand)
+        if parsed.model:
+            # Avoid repeating brand if model already starts with it
+            model = parsed.model
+            if parsed.brand and model.lower().startswith(parsed.brand.lower()):
+                model = model[len(parsed.brand):].strip()
+            if model:
+                components.append(model)
+        if parsed.variant:
+            components.append(parsed.variant)
+        if parsed.storage:
+            components.append(parsed.storage)
+        if parsed.ram:
+            components.append(parsed.ram)
+        if parsed.color:
+            components.append(parsed.color)
+            
+        canonical_name = " ".join(components) if components else original_query
+        
         return ProductInfo(
-            canonical_name=original_query,
+            canonical_name=canonical_name,
             brand=parsed.brand,
             model=parsed.model,
             variant=parsed.variant,
@@ -439,10 +476,21 @@ class SearchOrchestrator:
                         await session.flush()
                         
                     # Get or create ProductListing
-                    stmt = select(ProductListing).where(
+                    # Preserve seller distinctions and variant distinctions
+                    conditions = [
                         ProductListing.product_id == product.id,
                         ProductListing.platform_id == platform.id
-                    )
+                    ]
+                    
+                    if price_data.external_product_id:
+                        conditions.append(ProductListing.external_product_id == price_data.external_product_id)
+                    else:
+                        conditions.append(ProductListing.url == price_data.url)
+                        
+                    if price_data.seller:
+                        conditions.append(ProductListing.seller == price_data.seller)
+                        
+                    stmt = select(ProductListing).where(*conditions)
                     result = await session.execute(stmt)
                     listing = result.scalar_one_or_none()
                     

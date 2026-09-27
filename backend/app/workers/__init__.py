@@ -58,9 +58,7 @@ class PriceTracker:
         from sqlalchemy import select, or_, update
         from app.database import async_session
         from app.models.models import TrackingJob, ProductListing, PriceObservation, TrackingStatus, SourceType
-        from app.adapters.generic import GenericAdapter
-        
-        generic_adapter = GenericAdapter()
+        from app.adapters.registry import adapter_registry
 
         try:
             async with async_session() as session:
@@ -90,7 +88,12 @@ class PriceTracker:
                 for job, listing in jobs_to_run:
                     try:
                         logger.info(f"Tracking job {job.id}: fetching {listing.url}")
-                        product_data = await generic_adapter.extract_product(listing.url)
+                        adapter = adapter_registry.get_adapter(listing.url)
+                        if adapter:
+                            product_data = await adapter.extract_product(listing.url)
+                        else:
+                            product_data = None
+                        
                         
                         if product_data and product_data.price:
                             # 3. Store new price observation

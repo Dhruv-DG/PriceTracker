@@ -55,6 +55,9 @@ async def lifespan(app: FastAPI):
     # Initialize Adapter Registry
     from app.adapters.registry import adapter_registry
     from app.adapters.generic import GenericAdapter
+    from app.adapters.amazon import AmazonAdapter
+    
+    adapter_registry.register(AmazonAdapter())
     adapter_registry.set_fallback(GenericAdapter())
     logger.info("Adapter registry initialized")
     
