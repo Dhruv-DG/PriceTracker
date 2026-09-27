@@ -140,6 +140,8 @@ class Search(Base):
     query = Column(String(1000), nullable=False, index=True)
     parsed_query = Column(JSON)  # LLM-parsed product attributes
     status = Column(String(50), default="DISCOVERING") # ENRICHING, COMPLETED, FAILED
+    product_id = Column(Integer, ForeignKey("products.id"), nullable=True)
+    dashboard_data = Column(JSON, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
     results_count = Column(Integer, default=0)
     latency_ms = Column(Float)

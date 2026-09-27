@@ -31,6 +31,16 @@ class KeepaProvider(HistoricalPriceProvider):
         """Keepa primarily handles Amazon domains."""
         return "amazon" in platform_domain.lower() and bool(self.api_key)
         
+    async def can_provide(self, platform_domain: str) -> bool:
+        return await self.can_handle(platform_domain)
+
+    async def is_available(self) -> bool:
+        return bool(self.api_key)
+        
+    @property
+    def name(self) -> str:
+        return self.provider_name
+        
     def _parse_keepa_time(self, keepa_minutes: int) -> datetime:
         """Convert Keepa time (minutes since Jan 1, 2011) to datetime."""
         base_time = datetime(2011, 1, 1)
@@ -62,15 +72,19 @@ class KeepaProvider(HistoricalPriceProvider):
             
         return observations
         
-    async def get_history(self, listing: ProductListing, platform_name: str, platform_domain: str) -> Optional[HistoricalPriceResult]:
-        """Fetch historical prices from Keepa for a listing."""
+    async def get_history(
+        self, 
+        product_identifier: str, 
+        platform_domain: str,
+        days: int = 365
+    ) -> Optional[HistoricalPriceResult]:
+        """Fetch historical prices from Keepa for a product (using ASIN)."""
         if not await self.can_handle(platform_domain):
             return None
             
-        # Try to get ASIN from identifiers or external_product_id
-        asin = listing.external_product_id
+        asin = product_identifier
         if not asin:
-            logger.warning(f"No ASIN found for listing {listing.id} on {platform_domain}")
+            logger.warning(f"No ASIN provided for {platform_domain}")
             return None
             
         # Determine Keepa domain ID
@@ -124,7 +138,7 @@ class KeepaProvider(HistoricalPriceProvider):
                     
                 return HistoricalPriceResult(
                     provider=self.provider_name,
-                    platform=platform_name,
+                    platform=platform_domain.split(".")[0].title(),
                     platform_domain=platform_domain,
                     product_id=asin,
                     currency=currency,

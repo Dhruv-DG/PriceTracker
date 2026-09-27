@@ -5,7 +5,7 @@ POST /api/search — the main entry point for the application.
 import logging
 from fastapi import APIRouter, HTTPException
 
-from app.schemas.schemas import SearchRequest, SearchResponse
+from app.schemas.schemas import SearchRequest, SearchResponse, SearchStatusResponse
 from app.services.search_service import SearchOrchestrator
 
 logger = logging.getLogger(__name__)
@@ -34,7 +34,7 @@ async def search(request: SearchRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/search/{search_id}/status", response_model=SearchResponse)
+@router.get("/search/{search_id}/status", response_model=SearchStatusResponse)
 async def get_search_status(search_id: int):
     """
     Get the status of an ongoing or completed search.

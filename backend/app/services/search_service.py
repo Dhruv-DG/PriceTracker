@@ -60,12 +60,14 @@ class SearchOrchestrator:
         errors = []
         warnings = []
         
+        t_start = time.time()
         logger.info(f"search_started: query='{request.query}'")
 
         try:
             # Step 1: Parse the query
             parsed_query = await llm_service.parse_query(request.query)
-            logger.info(f"Parsed query: {parsed_query}")
+            t_parse = time.time()
+            logger.info(f"Parsed query: {parsed_query} (took {round((t_parse - t_start)*1000)}ms)")
 
             # Step 2: Check cache
             cache_key = make_cache_key(request.query)
@@ -77,7 +79,8 @@ class SearchOrchestrator:
             # Step 3: Search for products
             search_query = parsed_query.search_query or request.query
             search_results = await self.search_provider.search(search_query)
-            logger.info(f"candidate_count: {len(search_results)}")
+            t_search = time.time()
+            logger.info(f"candidate_count: {len(search_results)} (took {round((t_search - t_parse)*1000)}ms)")
 
             if not search_results:
                 warnings.append("No search results found")
@@ -91,7 +94,8 @@ class SearchOrchestrator:
 
             # Step 4: Filter and classify results
             product_results = await self._filter_results(search_results, parsed_query)
-            logger.info(f"candidate_matched: {len(product_results)}")
+            t_filter = time.time()
+            logger.info(f"candidate_matched: {len(product_results)} (took {round((t_filter - t_search)*1000)}ms)")
 
             # Step 5: Build product info
             product = self._build_product_info(parsed_query, request.query)
@@ -100,18 +104,23 @@ class SearchOrchestrator:
             current_prices = await self._get_current_prices(
                 product_results, parsed_query, request.query
             )
-            logger.info(f"Got {len(current_prices)} current prices")
+            t_prices = time.time()
+            logger.info(f"Got {len(current_prices)} current prices (took {round((t_prices - t_filter)*1000)}ms)")
 
             if not current_prices:
                 warnings.append("Could not extract prices from any platform")
 
             # Step 7: Persist to database if not in demo mode
+            product_id = None
             if not settings.is_demo_mode and current_prices:
                 try:
-                    await self._save_observations_to_db(product, current_prices)
+                    product_id = await self._save_observations_to_db(product, current_prices)
                 except Exception as db_e:
                     logger.error(f"Failed to persist observations: {db_e}", exc_info=True)
                     warnings.append("Data persistence failed.")
+                    
+            t_persist = time.time()
+            logger.info(f"Persistence took {round((t_persist - t_prices)*1000)}ms")
 
             # Create Search record in database
             search_id = None
@@ -121,7 +130,8 @@ class SearchOrchestrator:
                     search_record = Search(
                         query=request.query,
                         parsed_query=parsed_query.model_dump(),
-                        status="ENRICHING"
+                        status="ENRICHING",
+                        product_id=product_id
                     )
                     session.add(search_record)
                     await session.commit()
@@ -135,7 +145,7 @@ class SearchOrchestrator:
                 parsed_query=parsed_query,
                 product=product,
                 current_prices=current_prices,
-                status="ENRICHING",
+                status="ENRICHING" if search_id else "COMPLETED",
                 is_demo=settings.is_demo_mode,
                 latency_ms=latency,
                 errors=errors,
@@ -191,7 +201,8 @@ class SearchOrchestrator:
             async with async_session() as session:
                 stmt = update(Search).where(Search.id == search_id).values(
                     status="COMPLETED",
-                    latency_ms=dashboard.latency_ms
+                    latency_ms=dashboard.latency_ms,
+                    dashboard_data=dashboard.model_dump()
                 )
                 await session.execute(stmt)
                 await session.commit()
@@ -221,8 +232,14 @@ class SearchOrchestrator:
             return None
             
         cache_key = f"dashboard_{search_id}"
-        dashboard = await search_cache.get(cache_key)
+        dashboard_dict = await search_cache.get(cache_key)
         
+        # If cache missed but we have it in DB, use the DB copy
+        if not dashboard_dict and search_record.dashboard_data:
+            dashboard_dict = search_record.dashboard_data
+            # Re-cache it for future
+            await search_cache.set(cache_key, dashboard_dict, settings.CACHE_TTL_SEARCH)
+            
         is_completed = search_record.status == "COMPLETED"
         
         return SearchStatusResponse(
@@ -231,7 +248,7 @@ class SearchOrchestrator:
             history_ready=is_completed,
             analytics_ready=is_completed,
             completed=is_completed,
-            dashboard=dashboard
+            dashboard=dashboard_dict
         )
 
     async def _filter_results(
@@ -441,8 +458,12 @@ class SearchOrchestrator:
                     provider = await self.history_registry.get_provider(price.platform.domain)
                     
                 logger.info(f"history_provider_used: platform={price.platform.domain} provider={provider.name}")
+                
+                # Use ASIN (external_product_id) for Keepa/Amazon, otherwise canonical name
+                identifier = price.external_product_id if price.external_product_id and "amazon" in price.platform.domain.lower() else product.canonical_name
+                
                 history = await provider.get_history(
-                    product_identifier=product.canonical_name,
+                    product_identifier=identifier,
                     platform_domain=price.platform.domain,
                 )
                 if history and history.observations:
@@ -569,12 +590,14 @@ class SearchOrchestrator:
             most_consistent_metric=metric,
         )
 
-    async def _save_observations_to_db(self, product_info: ProductInfo, current_prices: List[PriceData]):
-        """Persist product, platforms, listings, and price observations to the database."""
-        try:
-            logger.info(f"database_write: start product={product_info.canonical_name} prices={len(current_prices)}")
-            from sqlalchemy import select
-            async with async_session() as session:
+    async def _save_observations_to_db(self, product_info: ProductInfo, current_prices: List[PriceData]) -> Optional[int]:
+        """Persist product, platforms, listings, and price observations to the database.
+        Returns the product ID. Raises exception on failure.
+        """
+        logger.info(f"database_write: start product={product_info.canonical_name} prices={len(current_prices)}")
+        from sqlalchemy import select
+        async with async_session() as session:
+            try:
                 # 1. Get or create Product
                 stmt = select(Product).where(Product.canonical_name == product_info.canonical_name)
                 result = await session.execute(stmt)
@@ -654,8 +677,11 @@ class SearchOrchestrator:
                 
                 await session.commit()
                 logger.info(f"Saved {len(current_prices)} observations for {product_info.canonical_name} to DB")
-        except Exception as e:
-            logger.error(f"Error saving observations to DB: {e}", exc_info=True)
+                return product.id
+            except Exception as e:
+                await session.rollback()
+                logger.error(f"Error saving observations to DB: {e}", exc_info=True)
+                raise
 
 
 # Global orchestrator instance
