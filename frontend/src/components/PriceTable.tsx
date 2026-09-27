@@ -2,7 +2,7 @@ import React from 'react';
 import { ShoppingCart, ExternalLink } from 'lucide-react';
 import type { PriceData } from '../types';
 import { getPlatformColor } from '../utils/theme';
-import { formatPrice, formatPct, formatTimeAgo } from '../utils/format';
+import { formatPrice, formatTimeAgo } from '../utils/format';
 
 interface PriceTableProps {
   prices: PriceData[];
@@ -11,7 +11,8 @@ interface PriceTableProps {
 export const PriceTable: React.FC<PriceTableProps> = ({ prices }) => {
   if (!prices.length) return null;
 
-  const lowestPrice = Math.min(...prices.map(p => p.effective_price));
+  const positivePrices = prices.filter(p => p.effective_price > 0);
+  const lowestPrice = positivePrices.length > 0 ? Math.min(...positivePrices.map(p => p.effective_price)) : 0;
 
   return (
     <div className="dashboard-section">
@@ -32,6 +33,7 @@ export const PriceTable: React.FC<PriceTableProps> = ({ prices }) => {
               <th>Discount</th>
               <th>Shipping</th>
               <th>Effective Price</th>
+              <th>Status</th>
               <th>Seller</th>
               <th>Availability</th>
               <th></th>
@@ -48,12 +50,19 @@ export const PriceTable: React.FC<PriceTableProps> = ({ prices }) => {
                         className="platform-dot"
                         style={{ background: getPlatformColor(price.platform.name, index) }}
                       />
-                      <span>{price.platform.name}</span>
+                      <div>
+                        <span>{price.platform.name}</span>
+                        {price.title && (
+                          <div style={{ fontSize: '11px', color: 'var(--color-text-muted)', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {price.title}
+                          </div>
+                        )}
+                      </div>
                     </div>
                   </td>
                   <td>
-                    <span className={`price-value ${isLowest ? 'price-lowest' : ''}`}>
-                      {formatPrice(price.price)}
+                    <span className={`price-value ${isLowest && price.price > 0 ? 'price-lowest' : ''}`}>
+                      {price.price > 0 ? formatPrice(price.price) : <span style={{ color: 'var(--color-text-muted)' }}>Unknown</span>}
                     </span>
                   </td>
                   <td>
@@ -74,10 +83,10 @@ export const PriceTable: React.FC<PriceTableProps> = ({ prices }) => {
                     {price.shipping_note}
                   </td>
                   <td>
-                    <span className={`price-value ${isLowest ? 'price-lowest' : ''}`}>
-                      {formatPrice(price.effective_price)}
+                    <span className={`price-value ${isLowest && price.effective_price > 0 ? 'price-lowest' : ''}`}>
+                      {price.effective_price > 0 ? formatPrice(price.effective_price) : <span style={{ color: 'var(--color-text-muted)' }}>Unknown</span>}
                     </span>
-                    {isLowest && (
+                    {isLowest && price.effective_price > 0 && (
                       <span style={{
                         marginLeft: 6,
                         fontSize: '10px',
@@ -88,6 +97,23 @@ export const PriceTable: React.FC<PriceTableProps> = ({ prices }) => {
                         fontWeight: 600,
                       }}>
                         LOWEST
+                      </span>
+                    )}
+                  </td>
+                  <td>
+                    {price.verification_status === 'PENDING' && (
+                      <span className="badge badge-warning" style={{ fontSize: '11px', padding: '2px 6px', background: 'var(--color-warning-bg)', color: 'var(--color-warning)', borderRadius: '4px' }}>
+                        Verifying...
+                      </span>
+                    )}
+                    {price.verification_status === 'VERIFIED' && (
+                      <span className="badge badge-success" style={{ fontSize: '11px', padding: '2px 6px', background: 'var(--color-success-bg)', color: 'var(--color-success)', borderRadius: '4px' }}>
+                        Verified
+                      </span>
+                    )}
+                    {price.verification_status === 'FAILED' && (
+                      <span className="badge badge-error" style={{ fontSize: '11px', padding: '2px 6px', background: 'var(--color-danger-bg)', color: 'var(--color-danger)', borderRadius: '4px' }}>
+                        Unverified
                       </span>
                     )}
                   </td>

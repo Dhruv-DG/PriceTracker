@@ -6,7 +6,7 @@ import json
 import re
 import httpx
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from app.config import settings
 from app.schemas.schemas import ParsedQuery
@@ -22,17 +22,19 @@ class LLMService:
     def __init__(self):
         self.api_key = settings.GEMINI_API_KEY
         self.model = settings.GEMINI_MODEL
+        self._circuit_open = False  # Circuit-breaker: disable LLM after first failure
 
     async def parse_query(self, query: str) -> ParsedQuery:
         """
         Parse a natural-language product query into structured attributes.
         Uses LLM when available, falls back to rule-based parsing.
         """
-        if self.api_key and not settings.is_demo_mode:
+        if self.api_key and not settings.is_demo_mode and not self._circuit_open:
             try:
                 return await self._llm_parse_query(query)
             except Exception as e:
                 logger.warning(f"LLM parse failed, using fallback: {e}")
+                self._circuit_open = True
 
         return self._rule_based_parse(query)
 
@@ -45,7 +47,7 @@ class LLMService:
         Determine if a candidate listing matches the queried product.
         Returns match confidence and reasoning.
         """
-        if self.api_key and not settings.is_demo_mode:
+        if self.api_key and not settings.is_demo_mode and not self._circuit_open:
             try:
                 return await self._llm_match_product(query_product, candidate_title)
             except Exception as e:
@@ -55,13 +57,30 @@ class LLMService:
 
     async def classify_search_result(self, title: str, url: str, snippet: str) -> Dict[str, Any]:
         """Classify a search result as product page, category page, etc."""
-        if self.api_key and not settings.is_demo_mode:
+        if self.api_key and not settings.is_demo_mode and not self._circuit_open:
             try:
                 return await self._llm_classify(title, url, snippet)
             except Exception as e:
                 logger.warning(f"LLM classify failed, using fallback: {e}")
 
         return self._rule_based_classify(title, url, snippet)
+
+    async def batch_classify_search_results(self, candidates: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        """
+        Classify multiple search results in a single LLM call.
+        candidates should be a list of dicts with 'title', 'url', 'snippet'.
+        """
+        if not candidates:
+            return []
+            
+        if self.api_key and not settings.is_demo_mode and not self._circuit_open:
+            try:
+                return await self._llm_batch_classify(candidates)
+            except Exception as e:
+                logger.warning(f"LLM batch classify failed, using fallback: {e}")
+
+        # Fallback to rule-based for all
+        return [self._rule_based_classify(c["title"], c["url"], c.get("snippet", "")) for c in candidates]
 
     # ─── Gemini LLM Implementations ─────────────────────────
 
@@ -157,9 +176,51 @@ Return ONLY valid JSON:
 
         return self._rule_based_classify(title, url, snippet)
 
+    async def _llm_batch_classify(self, candidates: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        """Use Gemini to classify multiple search results in one prompt."""
+        candidates_text = ""
+        for i, c in enumerate(candidates):
+            candidates_text += f"\n--- Item {i} ---\nTitle: \"{c['title']}\"\nURL: {c['url']}\nSnippet: \"{c.get('snippet', '')}\"\n"
+
+        prompt = f"""You are an e-commerce classification engine.
+Your job is to identify if a search result is a direct PRODUCT PURCHASE PAGE.
+
+Reject any page that is:
+- A blog, review, or news article
+- A YouTube video or informational page
+- A generic category or search results page (e.g. "Search results for...")
+- A non-ecommerce site (like Wikipedia, forums, etc.)
+
+Evaluate these search results:
+
+{candidates_text}
+
+Return ONLY valid JSON as a list of objects, strictly in the same order as the inputs (0 to {len(candidates)-1}):
+[
+  {{
+    "type": "product_page" | "category_page" | "blog" | "review" | "other",
+    "is_ecommerce": true/false, // Must be true ONLY if it's a store where you can buy items
+    "confidence": 0.0 to 1.0,
+    "platform_name": "store name or null"
+  }},
+  ...
+]"""
+
+        result = await self._call_gemini(prompt)
+        if result:
+            try:
+                parsed = self._extract_json(result)
+                if isinstance(parsed, list) and len(parsed) == len(candidates):
+                    return parsed
+            except Exception as e:
+                logger.warning(f"Failed to parse batch JSON: {e}")
+                pass
+
+        raise Exception("Batch classification LLM fallback triggered")
+
     async def _call_gemini(self, prompt: str) -> Optional[str]:
         """Call the Gemini API."""
-        if not self.api_key:
+        if not self.api_key or self._circuit_open:
             return None
 
         url = self.GEMINI_URL.format(model=self.model)
@@ -185,8 +246,12 @@ Return ONLY valid JSON:
                 if parts:
                     return parts[0].get("text", "")
 
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Gemini API HTTP {e.response.status_code} — disabling LLM for this session")
+            self._circuit_open = True
         except Exception as e:
             logger.error(f"Gemini API error: {e}")
+            self._circuit_open = True
 
         return None
 

@@ -88,7 +88,7 @@ function App() {
       </header>
 
       {/* Demo Banner */}
-      {(searchResult?.is_demo || (!searchResult && true)) && (
+      {searchResult?.is_demo && (
         <div className="demo-banner">
           <AlertTriangle size={14} />
           <span>
@@ -133,8 +133,8 @@ function App() {
           />
 
           {/* Current Prices Table is available immediately */}
-          {searchResult.current_prices && searchResult.current_prices.length > 0 && (
-            <PriceTable prices={searchResult.current_prices} />
+          {(searchResult.dashboard?.current_prices || searchResult.current_prices) && (searchResult.dashboard?.current_prices || searchResult.current_prices).length > 0 && (
+            <PriceTable prices={searchResult.dashboard?.current_prices || searchResult.current_prices} />
           )}
           
           {/* While history is loading, show a banner */}

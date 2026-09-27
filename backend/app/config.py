@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "Price Intelligence Dashboard"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = True
-    DEMO_MODE: bool = True  # Default to demo mode so app works without API keys
+    DEMO_MODE: bool = False  # Set to True to run without API keys
 
     # Server
     HOST: str = "0.0.0.0"
@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     # LLM Provider
     LLM_PROVIDER: str = "gemini"  # "gemini" or "demo"
     GEMINI_API_KEY: Optional[str] = None
-    GEMINI_MODEL: str = "gemini-2.0-flash"
+    GEMINI_MODEL: str = "gemini-2.0-flash-lite"
 
     # Historical Price Providers
     KEEPA_API_KEY: Optional[str] = None

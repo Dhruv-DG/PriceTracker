@@ -53,6 +53,7 @@ class SearchResultItem(BaseModel):
     is_product_page: bool = False
     relevance_score: float = 0.0
     metadata: Dict[str, Any] = {}
+    match_confidence: str = "HIGH"
 
 
 # ─── Product ─────────────────────────────────────────────
@@ -104,6 +105,16 @@ class PriceData(BaseModel):
     title: Optional[str] = None
     last_updated: datetime = Field(default_factory=datetime.utcnow)
     external_product_id: Optional[str] = None
+    
+    # Discovery & Verification fields
+    search_price: Optional[float] = None
+    verified_price: Optional[float] = None
+    verification_status: str = "PENDING"  # PENDING, VERIFIED, FAILED
+    discovery_source: str = "search"
+    match_confidence: str = "HIGH"
+    thumbnail: Optional[str] = None
+    rating: Optional[float] = None
+    review_count: Optional[int] = None
 
 
 class HistoricalObservation(BaseModel):

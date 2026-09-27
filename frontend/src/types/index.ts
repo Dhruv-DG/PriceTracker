@@ -57,6 +57,16 @@ export interface PriceData {
   title: string | null;
   last_updated: string;
   external_product_id: string | null;
+  
+  // Discovery & Verification fields
+  search_price: number | null;
+  verified_price: number | null;
+  verification_status: 'PENDING' | 'VERIFIED' | 'FAILED';
+  discovery_source: string;
+  match_confidence: string;
+  thumbnail: string | null;
+  rating: number | null;
+  review_count: number | null;
 }
 
 export interface HistoricalObservation {

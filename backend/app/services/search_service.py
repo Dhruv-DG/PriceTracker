@@ -100,30 +100,17 @@ class SearchOrchestrator:
             # Step 5: Build product info
             product = self._build_product_info(parsed_query, request.query)
 
-            # Step 6: Get current prices (concurrent)
-            current_prices = await self._get_current_prices(
-                product_results, parsed_query, request.query
-            )
+            # Step 6: Build provisional prices (fast)
+            current_prices = self._build_provisional_prices(product_results)
             t_prices = time.time()
-            logger.info(f"Got {len(current_prices)} current prices (took {round((t_prices - t_filter)*1000)}ms)")
+            logger.info(f"Generated {len(current_prices)} provisional prices (took {round((t_prices - t_filter)*1000)}ms)")
 
             if not current_prices:
-                warnings.append("Could not extract prices from any platform")
-
-            # Step 7: Persist to database if not in demo mode
-            product_id = None
-            if not settings.is_demo_mode and current_prices:
-                try:
-                    product_id = await self._save_observations_to_db(product, current_prices)
-                except Exception as db_e:
-                    logger.error(f"Failed to persist observations: {db_e}", exc_info=True)
-                    warnings.append("Data persistence failed.")
-                    
-            t_persist = time.time()
-            logger.info(f"Persistence took {round((t_persist - t_prices)*1000)}ms")
+                warnings.append("Could not find any market candidates")
 
             # Create Search record in database
             search_id = None
+            product_id = None
             if not settings.is_demo_mode:
                 from app.models.models import Search
                 async with async_session() as session:
@@ -157,7 +144,9 @@ class SearchOrchestrator:
                 asyncio.create_task(self.enrich_search(
                     search_id=search_id,
                     product=product,
-                    current_prices=current_prices,
+                    provisional_prices=current_prices,
+                    parsed_query=parsed_query,
+                    original_query=request.query,
                     start_time=start_time
                 ))
             else:
@@ -177,12 +166,33 @@ class SearchOrchestrator:
                 errors=[str(e)],
             )
 
-    async def enrich_search(self, search_id: int, product: ProductInfo, current_prices: List[PriceData], start_time: float):
-        """Background task to fetch history and build dashboard."""
+    async def enrich_search(
+        self, 
+        search_id: int, 
+        product: ProductInfo, 
+        provisional_prices: List[PriceData], 
+        parsed_query: ParsedQuery,
+        original_query: str,
+        start_time: float
+    ):
+        """Background task to fetch verified prices, history and build dashboard."""
         try:
             logger.info(f"enrich_search started for search_id={search_id}")
             
-            # Step 1: Get historical data (concurrent)
+            # Step 1: Verify provisional prices via adapters
+            current_prices = await self._get_current_prices(
+                provisional_prices, parsed_query, original_query
+            )
+            
+            # Step 1.5: Persist to database if not in demo mode
+            product_id = None
+            if not settings.is_demo_mode and current_prices:
+                try:
+                    product_id = await self._save_observations_to_db(product, current_prices)
+                except Exception as db_e:
+                    logger.error(f"Failed to persist observations: {db_e}", exc_info=True)
+            
+            # Step 2: Get historical data (concurrent)
             platform_histories = await self._get_historical_data(product, current_prices)
             logger.info(f"Got history for {len(platform_histories)} platforms")
 
@@ -199,11 +209,15 @@ class SearchOrchestrator:
             from app.models.models import Search
             from sqlalchemy import update
             async with async_session() as session:
-                stmt = update(Search).where(Search.id == search_id).values(
-                    status="COMPLETED",
-                    latency_ms=dashboard.latency_ms,
-                    dashboard_data=dashboard.model_dump()
-                )
+                update_values = {
+                    "status": "COMPLETED",
+                    "latency_ms": dashboard.latency_ms,
+                    "dashboard_data": dashboard.model_dump(mode='json')
+                }
+                if product_id:
+                    update_values["product_id"] = product_id
+                    
+                stmt = update(Search).where(Search.id == search_id).values(**update_values)
                 await session.execute(stmt)
                 await session.commit()
                 
@@ -251,6 +265,61 @@ class SearchOrchestrator:
             dashboard=dashboard_dict
         )
 
+    def _build_provisional_prices(self, results: List[SearchResultItem]) -> List[PriceData]:
+        """Convert initial SearchResultItems into provisional PriceData objects."""
+        prices = []
+        for r in results:
+            domain = r.domain.replace("www.", "")
+            platform_name = r.metadata.get("platform_name") or r.metadata.get("source_store") or domain.split(".")[0].title()
+            
+            # Parse search engine price — may be a string like "₹82,900" or "$99,900"
+            raw_price = r.metadata.get("extracted_price") or r.metadata.get("price")
+            
+            # If no price in metadata (organic results), try extracting from the snippet
+            if not raw_price and r.snippet:
+                import re
+                # Match ₹ or Rs followed by numbers and commas
+                snippet_match = re.search(r'(?:₹|Rs\.?\s*)\s*([\d,]+(?:\.\d+)?)', r.snippet, re.IGNORECASE)
+                if snippet_match:
+                    raw_price = snippet_match.group(1)
+
+            search_price = self._parse_price_string(raw_price) if raw_price else None
+            price_val = search_price if search_price else 0.0
+            
+            p = PriceData(
+                platform=PlatformInfo(name=platform_name, domain=domain),
+                url=r.url,
+                price=price_val,
+                effective_price=price_val,
+                title=r.title or None,
+                search_price=search_price,
+                verification_status="PENDING",
+                discovery_source=r.source,
+                match_confidence=r.match_confidence,
+                thumbnail=r.metadata.get("thumbnail"),
+                rating=float(r.metadata["rating"]) if r.metadata.get("rating") else None,
+                review_count=int(r.metadata["reviews"]) if r.metadata.get("reviews") else None,
+            )
+            prices.append(p)
+            
+        return prices
+
+    @staticmethod
+    def _parse_price_string(raw: any) -> Optional[float]:
+        """Parse a price that may be a number or a string like '₹82,900'."""
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        if isinstance(raw, str):
+            import re
+            # Strip everything except digits and decimal point
+            cleaned = re.sub(r'[^\d.]', '', raw)
+            if cleaned:
+                try:
+                    return float(cleaned)
+                except ValueError:
+                    pass
+        return None
+
     async def _filter_results(
         self,
         results: List[SearchResultItem],
@@ -269,6 +338,7 @@ class SearchOrchestrator:
         # 1. Deterministic filtering first
         needs_llm = []
         filtered = []
+        seen_domains = set()
         
         # We need the product name to be at least partially present
         brand = (parsed_query.brand or "").lower()
@@ -277,6 +347,10 @@ class SearchOrchestrator:
         for r in unique_results:
             title = (r.title or "").lower()
             url = r.url.lower()
+            normalized_domain = r.domain.replace("www.", "")
+            
+            if normalized_domain in seen_domains:
+                continue
             
             # Fast reject: definitely not a product page (e.g. review, news, blog)
             if any(bad in url for bad in ["/review", "/news", "/blog", "forum", "/article"]):
@@ -285,56 +359,99 @@ class SearchOrchestrator:
             # Fast accept: highly likely a product page and matches brand/model
             if brand and model and brand in title and model in title:
                 # If it's a known e-commerce URL structure
-                if any(good in url for good in ["/p/", "/dp/", "/product/", "/itm/"]):
+                if any(good in url for good in ["/p/", "/dp/", "/product/", "/itm/", "buy", "shop"]):
                     r.is_product_page = True
                     r.relevance_score = 0.9
+                    
+                    # Estimate confidence
+                    if parsed_query.storage and parsed_query.storage.lower() in title and \
+                       parsed_query.color and parsed_query.color.lower() in title:
+                        r.match_confidence = "EXACT"
+                    elif parsed_query.storage and parsed_query.storage.lower() in title:
+                        r.match_confidence = "HIGH"
+                    else:
+                        r.match_confidence = "MEDIUM"
+                        
                     filtered.append(r)
+                    seen_domains.add(normalized_domain)
                     continue
+                    
+            # For shopping results from serper, they are almost definitely products
+            if r.source == "serper_shopping":
+                r.is_product_page = True
+                r.relevance_score = 0.8
+                r.match_confidence = "HIGH" if (brand in title and model in title) else "MEDIUM"
+                filtered.append(r)
+                seen_domains.add(normalized_domain)
+                continue
             
-            # Ambiguous: send to LLM
+            # Ambiguous: send to LLM or use rule-based fallback
             needs_llm.append(r)
 
-        # 2. Parallelize LLM classification for ambiguous results (with concurrency limit)
-        llm_semaphore = asyncio.Semaphore(5)
-        
-        async def classify_and_filter(result: SearchResultItem) -> Optional[SearchResultItem]:
-            async with llm_semaphore:
-                try:
-                    classification = await llm_service.classify_search_result(
-                        result.title, result.url, result.snippet or ""
-                    )
-                    if classification.get("is_ecommerce") and classification.get("type") == "product_page":
-                        result.is_product_page = True
-                        result.relevance_score = classification.get("confidence", 0.5)
-                        return result
-                except Exception as e:
-                    logger.warning(f"Classification failed for {result.url}: {e}")
-                return None
-
-        if needs_llm:
-            tasks = [classify_and_filter(r) for r in needs_llm]
-            classified = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            for r in classified:
-                if isinstance(r, SearchResultItem):
+        # 2. If LLM is available, classify ambiguous results in a single batch. Otherwise, use generous rule-based.
+        if needs_llm and not llm_service._circuit_open:
+            try:
+                candidates_data = [
+                    {"title": r.title, "url": r.url, "snippet": r.snippet} 
+                    for r in needs_llm
+                ]
+                batch_classifications = await llm_service.batch_classify_search_results(candidates_data)
+                
+                if len(batch_classifications) == len(needs_llm):
+                    for idx, classification in enumerate(batch_classifications):
+                        result = needs_llm[idx]
+                        domain_norm = result.domain.replace("www.", "")
+                        
+                        if domain_norm in seen_domains:
+                            continue
+                            
+                        # Strictly enforce that it must be an ecommerce platform
+                        if classification.get("is_ecommerce") and classification.get("type") == "product_page":
+                            result.is_product_page = True
+                            result.relevance_score = classification.get("confidence", 0.5)
+                            result.match_confidence = "MEDIUM" if result.relevance_score > 0.5 else "LOW"
+                            filtered.append(result)
+                            seen_domains.add(domain_norm)
+            except Exception as e:
+                logger.warning(f"Batch classification failed: {e}")
+        elif needs_llm:
+            # LLM unavailable — use strict rule-based acceptance (only known ecommerce sites)
+            KNOWN_ECOMMERCE = {
+                "amazon", "flipkart", "myntra", "ajio", "tatacliq", "croma",
+                "reliancedigital", "vijaysales", "poorvika", "apple", "samsung",
+                "jiomart", "snapdeal", "meesho", "paytmmall", "nykaa", "shopatsc"
+            }
+            for r in needs_llm:
+                domain_norm = r.domain.replace("www.", "")
+                if domain_norm in seen_domains:
+                    continue
+                    
+                domain_base = domain_norm.split(".")[0].lower()
+                # Accept ONLY if it's a known e-commerce domain
+                if domain_base in KNOWN_ECOMMERCE:
+                    r.is_product_page = True
+                    r.relevance_score = 0.6
+                    r.match_confidence = "LOW"
                     filtered.append(r)
+                    seen_domains.add(domain_norm)
 
         return filtered
 
     async def _get_current_prices(
         self,
-        product_results: List[SearchResultItem],
+        provisional_prices: List[PriceData],
         parsed_query: ParsedQuery,
         original_query: str,
     ) -> List[PriceData]:
         """Get current prices from all discovered platforms concurrently."""
         if settings.is_demo_mode:
-            return self._get_demo_prices(product_results, original_query)
+            # In demo mode, provisional prices are already populated
+            return provisional_prices
 
         # For real mode, extract prices concurrently
         from app.adapters.registry import adapter_registry
         
-        logger.info(f"price_fetch_started: count={len(product_results)}")
+        logger.info(f"price_fetch_started: count={len(provisional_prices)}")
 
         # Concurrency control
         global_limit = getattr(settings, "PRICE_EXTRACTION_GLOBAL_CONCURRENCY", 10)
@@ -344,55 +461,54 @@ class SearchOrchestrator:
         global_sem = asyncio.Semaphore(global_limit)
         domain_sems = {}
 
-        async def extract_price(result: SearchResultItem) -> Optional[PriceData]:
-            domain = result.domain.replace("www.", "")
+        async def extract_price(price_data: PriceData) -> PriceData:
+            domain = price_data.platform.domain
             if domain not in domain_sems:
                 domain_sems[domain] = asyncio.Semaphore(domain_limit)
                 
             async with global_sem:
                 async with domain_sems[domain]:
                     try:
-                        adapter = adapter_registry.get_adapter(result.url)
+                        adapter = adapter_registry.get_adapter(price_data.url)
                         if not adapter:
-                            logger.warning(f"No adapter could handle {result.url}")
-                            return None
+                            logger.warning(f"No adapter could handle {price_data.url}")
+                            price_data.verification_status = "FAILED"
+                            return price_data
                             
                         # Apply timeout to extraction
                         product = await asyncio.wait_for(
-                            adapter.extract_product(result.url), 
+                            adapter.extract_product(price_data.url), 
                             timeout=timeout_sec
                         )
                         
                         if product and product.price:
-                            platform_name = result.metadata.get("platform_name") or domain.split(".")[0].title()
-
-                            return PriceData(
-                                platform=PlatformInfo(
-                                    name=platform_name,
-                                    domain=domain,
-                                ),
-                                url=result.url,
-                                price=product.price,
-                                mrp=product.mrp,
-                                discount_pct=product.discount_pct,
-                                shipping=product.shipping,
-                                shipping_note="Free" if product.shipping == 0 else ("Unknown" if product.shipping is None else f"₹{product.shipping}"),
-                                effective_price=product.effective_price,
-                                currency=product.currency,
-                                availability=product.availability,
-                                seller=product.seller,
-                                fulfilled_by=product.fulfilled_by,
-                                condition=product.condition,
-                                title=product.title,
-                                external_product_id=product.external_id,
-                            )
+                            price_data.verified_price = product.price
+                            price_data.price = product.price
+                            price_data.mrp = product.mrp
+                            price_data.discount_pct = product.discount_pct
+                            price_data.shipping = product.shipping
+                            price_data.shipping_note = "Free" if product.shipping == 0 else ("Unknown" if product.shipping is None else f"₹{product.shipping}")
+                            price_data.effective_price = product.effective_price
+                            price_data.currency = product.currency
+                            price_data.availability = product.availability
+                            price_data.seller = product.seller
+                            price_data.fulfilled_by = product.fulfilled_by
+                            price_data.condition = product.condition
+                            price_data.title = product.title
+                            price_data.external_product_id = product.external_id
+                            price_data.verification_status = "VERIFIED"
+                        else:
+                            price_data.verification_status = "FAILED"
                     except asyncio.TimeoutError:
-                        logger.warning(f"Price extraction timed out for {result.url}")
+                        logger.warning(f"Price extraction timed out for {price_data.url}")
+                        price_data.verification_status = "FAILED"
                     except Exception as e:
-                        logger.warning(f"Price extraction failed for {result.url}: {e}")
-                    return None
+                        logger.warning(f"Price extraction failed for {price_data.url}: {e}")
+                        price_data.verification_status = "FAILED"
+                        
+                    return price_data
 
-        tasks = [extract_price(r) for r in product_results]
+        tasks = [extract_price(p) for p in provisional_prices]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         prices = []

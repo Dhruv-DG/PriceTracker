@@ -27,11 +27,14 @@ class AnalyticsService:
         platform_histories: List[PlatformHistory],
     ) -> HighlightCards:
         """Compute the top-level highlight cards."""
-        if not current_prices:
+        # Filter out 0 or null prices before doing any computation
+        valid_current_prices = [p for p in current_prices if p.effective_price and p.effective_price > 0]
+        
+        if not valid_current_prices:
             return HighlightCards()
 
-        prices = [p.effective_price for p in current_prices]
-        sorted_prices = sorted(current_prices, key=lambda p: p.effective_price)
+        prices = [p.effective_price for p in valid_current_prices]
+        sorted_prices = sorted(valid_current_prices, key=lambda p: p.effective_price)
 
         current_lowest = sorted_prices[0] if sorted_prices else None
         current_highest = sorted_prices[-1] if sorted_prices else None
@@ -46,7 +49,10 @@ class AnalyticsService:
 
         for ph in platform_histories:
             if ph.history.observations:
-                obs_prices = [o.price for o in ph.history.observations]
+                obs_prices = [o.price for o in ph.history.observations if o.price and o.price > 0]
+                if not obs_prices:
+                    continue
+                    
                 all_hist_prices.extend(obs_prices)
 
                 platform_low = min(obs_prices)
@@ -91,16 +97,17 @@ class AnalyticsService:
 
     def compute_statistics(self, prices: List[float]) -> PriceStatistics:
         """Compute descriptive statistics for a set of prices."""
-        if not prices:
+        valid_prices = [p for p in prices if p and p > 0]
+        if not valid_prices:
             return PriceStatistics()
 
         return PriceStatistics(
-            mean=round(statistics.mean(prices), 2),
-            median=round(statistics.median(prices), 2),
-            min=round(min(prices), 2),
-            max=round(max(prices), 2),
-            std_dev=round(statistics.stdev(prices), 2) if len(prices) > 1 else 0,
-            observations_count=len(prices),
+            mean=round(statistics.mean(valid_prices), 2),
+            median=round(statistics.median(valid_prices), 2),
+            min=round(min(valid_prices), 2),
+            max=round(max(valid_prices), 2),
+            std_dev=round(statistics.stdev(valid_prices), 2) if len(valid_prices) > 1 else 0,
+            observations_count=len(valid_prices),
         )
 
     def compute_volatility(
@@ -114,16 +121,19 @@ class AnalyticsService:
 
         for ph in platform_histories:
             obs = sorted(ph.history.observations, key=lambda o: o.date)
-            prices = [o.price for o in obs]
+            # Only consider valid, non-zero prices
+            prices = [o.price for o in obs if o.price and o.price > 0]
+            if not prices:
+                continue
+                
             all_prices.extend(prices)
 
             # Calculate daily percentage changes and raw changes
             for i in range(1, len(prices)):
                 change = prices[i] - prices[i - 1]
-                if prices[i - 1] != 0:
-                    pct_change = change / prices[i - 1]
-                    daily_changes.append(change)
-                    pct_changes.append(pct_change)
+                pct_change = change / prices[i - 1]
+                daily_changes.append(change)
+                pct_changes.append(pct_change)
 
         if not all_prices or len(all_prices) < 2:
             return VolatilityInfo()
@@ -197,7 +207,8 @@ class AnalyticsService:
             for ph in platform_histories:
                 for obs in ph.history.observations:
                     if abs((obs.date - cutoff).total_seconds()) < 86400 * 2:  # ~2 day window
-                        past_prices.append(obs.price)
+                        if obs.price and obs.price > 0:
+                            past_prices.append(obs.price)
 
             if past_prices:
                 past_avg = statistics.mean(past_prices)
@@ -234,7 +245,7 @@ class AnalyticsService:
         for ph in platform_histories:
             platform_name = ph.platform.name
             for obs in ph.history.observations:
-                if obs.date >= cutoff:
+                if obs.date >= cutoff and obs.price and obs.price > 0:
                     date_str = obs.date.strftime("%Y-%m-%d")
                     daily_data[date_str][platform_name] = obs.price
 

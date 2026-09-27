@@ -62,9 +62,15 @@ class OwnDatabaseProvider(HistoricalPriceProvider):
                     )
                 )
 
-                # If product_identifier is numeric, use product_id
+                # Filter by product — numeric = product_id, string = canonical name lookup
                 if product_identifier.isdigit():
                     query = query.where(ProductListing.product_id == int(product_identifier))
+                else:
+                    # Join to Product table and match by canonical name
+                    from app.models.models import Product
+                    query = query.join(Product, Product.id == ProductListing.product_id).where(
+                        Product.canonical_name == product_identifier
+                    )
 
                 result = await session.execute(query)
                 observations_rows = result.scalars().all()
