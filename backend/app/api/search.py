@@ -32,3 +32,21 @@ async def search(request: SearchRequest):
     except Exception as e:
         logger.error(f"Search endpoint error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/search/{search_id}/status", response_model=SearchResponse)
+async def get_search_status(search_id: int):
+    """
+    Get the status of an ongoing or completed search.
+    Returns the enriched dashboard when ready.
+    """
+    try:
+        status_res = await orchestrator.get_search_status(search_id)
+        if not status_res:
+            raise HTTPException(status_code=404, detail="Search not found")
+        return status_res
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Search status error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))

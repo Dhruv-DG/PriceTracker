@@ -139,6 +139,7 @@ class Search(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     query = Column(String(1000), nullable=False, index=True)
     parsed_query = Column(JSON)  # LLM-parsed product attributes
+    status = Column(String(50), default="DISCOVERING") # ENRICHING, COMPLETED, FAILED
     timestamp = Column(DateTime, default=datetime.utcnow)
     results_count = Column(Integer, default=0)
     latency_ms = Column(Float)

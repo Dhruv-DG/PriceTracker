@@ -14,7 +14,7 @@ from app.config import settings
 from app.schemas.schemas import (
     SearchRequest, SearchResponse, DashboardResponse, ParsedQuery,
     SearchResultItem, ProductInfo, PlatformInfo, PriceData,
-    PlatformHistory, HistoricalPriceResult, ConfidenceLevel,
+    PlatformHistory, HistoricalPriceResult, ConfidenceLevel, SearchStatusResponse
 )
 from app.services.llm_service import llm_service
 from app.services.analytics import analytics_service
@@ -105,44 +105,56 @@ class SearchOrchestrator:
             if not current_prices:
                 warnings.append("Could not extract prices from any platform")
 
-            # Step 7: Get historical data (concurrent)
-            platform_histories = await self._get_historical_data(
-                product, current_prices
-            )
-            logger.info(f"Got history for {len(platform_histories)} platforms")
-
-            # Step 8: Compute analytics
-            dashboard = self._build_dashboard(
-                product, current_prices, platform_histories
-            )
-            dashboard.is_demo = settings.is_demo_mode
-
-            latency = round((time.time() - start_time) * 1000, 1)
-            dashboard.latency_ms = latency
-
-            # Step 9: Persist to database if not in demo mode
+            # Step 7: Persist to database if not in demo mode
             if not settings.is_demo_mode and current_prices:
                 try:
                     await self._save_observations_to_db(product, current_prices)
                 except Exception as db_e:
                     logger.error(f"Failed to persist observations: {db_e}", exc_info=True)
-                    warnings.append("Data persistence failed. Results may not be saved for tracking.")
+                    warnings.append("Data persistence failed.")
+
+            # Create Search record in database
+            search_id = None
+            if not settings.is_demo_mode:
+                from app.models.models import Search
+                async with async_session() as session:
+                    search_record = Search(
+                        query=request.query,
+                        parsed_query=parsed_query.model_dump(),
+                        status="ENRICHING"
+                    )
+                    session.add(search_record)
+                    await session.commit()
+                    search_id = search_record.id
+
+            latency = round((time.time() - start_time) * 1000, 1)
 
             response = SearchResponse(
+                search_id=search_id,
                 query=request.query,
                 parsed_query=parsed_query,
                 product=product,
-                dashboard=dashboard,
+                current_prices=current_prices,
+                status="ENRICHING",
                 is_demo=settings.is_demo_mode,
                 latency_ms=latency,
                 errors=errors,
                 warnings=warnings,
             )
 
-            # Cache the result
-            await search_cache.set(cache_key, response, settings.CACHE_TTL_SEARCH)
+            # Spawn background task for history and analytics
+            if search_id:
+                asyncio.create_task(self.enrich_search(
+                    search_id=search_id,
+                    product=product,
+                    current_prices=current_prices,
+                    start_time=start_time
+                ))
+            else:
+                # If demo mode, just run it immediately? Or fake it. For now, just return.
+                pass
 
-            logger.info(f"search_completed: query='{request.query}', latency={latency}ms")
+            logger.info(f"search_initial_completed: query='{request.query}', latency={latency}ms")
             return response
 
         except Exception as e:
@@ -151,8 +163,76 @@ class SearchOrchestrator:
                 query=request.query,
                 is_demo=settings.is_demo_mode,
                 latency_ms=round((time.time() - start_time) * 1000, 1),
+                status="FAILED",
                 errors=[str(e)],
             )
+
+    async def enrich_search(self, search_id: int, product: ProductInfo, current_prices: List[PriceData], start_time: float):
+        """Background task to fetch history and build dashboard."""
+        try:
+            logger.info(f"enrich_search started for search_id={search_id}")
+            
+            # Step 1: Get historical data (concurrent)
+            platform_histories = await self._get_historical_data(product, current_prices)
+            logger.info(f"Got history for {len(platform_histories)} platforms")
+
+            # Step 2: Compute analytics and build dashboard
+            dashboard = self._build_dashboard(product, current_prices, platform_histories)
+            dashboard.is_demo = settings.is_demo_mode
+            dashboard.latency_ms = round((time.time() - start_time) * 1000, 1)
+
+            # Step 3: Cache the completed dashboard
+            cache_key = f"dashboard_{search_id}"
+            await search_cache.set(cache_key, dashboard, settings.CACHE_TTL_SEARCH)
+
+            # Step 4: Update database status
+            from app.models.models import Search
+            from sqlalchemy import update
+            async with async_session() as session:
+                stmt = update(Search).where(Search.id == search_id).values(
+                    status="COMPLETED",
+                    latency_ms=dashboard.latency_ms
+                )
+                await session.execute(stmt)
+                await session.commit()
+                
+            logger.info(f"enrich_search completed for search_id={search_id}")
+
+        except Exception as e:
+            logger.error(f"enrich_search error for search_id={search_id}: {e}", exc_info=True)
+            from app.models.models import Search
+            from sqlalchemy import update
+            async with async_session() as session:
+                stmt = update(Search).where(Search.id == search_id).values(status="FAILED")
+                await session.execute(stmt)
+                await session.commit()
+
+    async def get_search_status(self, search_id: int) -> Optional[SearchStatusResponse]:
+        from app.models.models import Search
+        from sqlalchemy import select
+        from app.schemas.schemas import SearchStatusResponse
+        
+        async with async_session() as session:
+            stmt = select(Search).where(Search.id == search_id)
+            result = await session.execute(stmt)
+            search_record = result.scalar_one_or_none()
+            
+        if not search_record:
+            return None
+            
+        cache_key = f"dashboard_{search_id}"
+        dashboard = await search_cache.get(cache_key)
+        
+        is_completed = search_record.status == "COMPLETED"
+        
+        return SearchStatusResponse(
+            status=search_record.status,
+            current_prices_ready=True,
+            history_ready=is_completed,
+            analytics_ready=is_completed,
+            completed=is_completed,
+            dashboard=dashboard
+        )
 
     async def _filter_results(
         self,
@@ -169,27 +249,58 @@ class SearchOrchestrator:
                 seen_urls.add(url)
                 unique_results.append(r)
 
-        # Parallelize classification
-        async def classify_and_filter(result: SearchResultItem) -> Optional[SearchResultItem]:
-            try:
-                classification = await llm_service.classify_search_result(
-                    result.title, result.url, result.snippet or ""
-                )
-                if classification.get("is_ecommerce") and classification.get("type") == "product_page":
-                    result.is_product_page = True
-                    result.relevance_score = classification.get("confidence", 0.5)
-                    return result
-            except Exception as e:
-                logger.warning(f"Classification failed for {result.url}: {e}")
-            return None
-
-        tasks = [classify_and_filter(r) for r in unique_results]
-        classified = await asyncio.gather(*tasks, return_exceptions=True)
-        
+        # 1. Deterministic filtering first
+        needs_llm = []
         filtered = []
-        for r in classified:
-            if isinstance(r, SearchResultItem):
-                filtered.append(r)
+        
+        # We need the product name to be at least partially present
+        brand = (parsed_query.brand or "").lower()
+        model = (parsed_query.model or "").lower()
+        
+        for r in unique_results:
+            title = (r.title or "").lower()
+            url = r.url.lower()
+            
+            # Fast reject: definitely not a product page (e.g. review, news, blog)
+            if any(bad in url for bad in ["/review", "/news", "/blog", "forum", "/article"]):
+                continue
+                
+            # Fast accept: highly likely a product page and matches brand/model
+            if brand and model and brand in title and model in title:
+                # If it's a known e-commerce URL structure
+                if any(good in url for good in ["/p/", "/dp/", "/product/", "/itm/"]):
+                    r.is_product_page = True
+                    r.relevance_score = 0.9
+                    filtered.append(r)
+                    continue
+            
+            # Ambiguous: send to LLM
+            needs_llm.append(r)
+
+        # 2. Parallelize LLM classification for ambiguous results (with concurrency limit)
+        llm_semaphore = asyncio.Semaphore(5)
+        
+        async def classify_and_filter(result: SearchResultItem) -> Optional[SearchResultItem]:
+            async with llm_semaphore:
+                try:
+                    classification = await llm_service.classify_search_result(
+                        result.title, result.url, result.snippet or ""
+                    )
+                    if classification.get("is_ecommerce") and classification.get("type") == "product_page":
+                        result.is_product_page = True
+                        result.relevance_score = classification.get("confidence", 0.5)
+                        return result
+                except Exception as e:
+                    logger.warning(f"Classification failed for {result.url}: {e}")
+                return None
+
+        if needs_llm:
+            tasks = [classify_and_filter(r) for r in needs_llm]
+            classified = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for r in classified:
+                if isinstance(r, SearchResultItem):
+                    filtered.append(r)
 
         return filtered
 
@@ -208,41 +319,61 @@ class SearchOrchestrator:
         
         logger.info(f"price_fetch_started: count={len(product_results)}")
 
-        async def extract_price(result: SearchResultItem) -> Optional[PriceData]:
-            try:
-                adapter = adapter_registry.get_adapter(result.url)
-                if not adapter:
-                    logger.warning(f"No adapter could handle {result.url}")
-                    return None
-                    
-                product = await adapter.extract_product(result.url)
-                if product and product.price:
-                    domain = result.domain.replace("www.", "")
-                    platform_name = result.metadata.get("platform_name") or domain.split(".")[0].title()
+        # Concurrency control
+        global_limit = getattr(settings, "PRICE_EXTRACTION_GLOBAL_CONCURRENCY", 10)
+        domain_limit = getattr(settings, "PRICE_EXTRACTION_DOMAIN_CONCURRENCY", 2)
+        timeout_sec = getattr(settings, "PRICE_EXTRACTION_TIMEOUT", 10)
+        
+        global_sem = asyncio.Semaphore(global_limit)
+        domain_sems = {}
 
-                    return PriceData(
-                        platform=PlatformInfo(
-                            name=platform_name,
-                            domain=domain,
-                        ),
-                        url=result.url,
-                        price=product.price,
-                        mrp=product.mrp,
-                        discount_pct=product.discount_pct,
-                        shipping=product.shipping,
-                        shipping_note="Free" if product.shipping == 0 else ("Unknown" if product.shipping is None else f"₹{product.shipping}"),
-                        effective_price=product.effective_price,
-                        currency=product.currency,
-                        availability=product.availability,
-                        seller=product.seller,
-                        fulfilled_by=product.fulfilled_by,
-                        condition=product.condition,
-                        title=product.title,
-                        external_product_id=product.external_id,
-                    )
-            except Exception as e:
-                logger.warning(f"Price extraction failed for {result.url}: {e}")
-            return None
+        async def extract_price(result: SearchResultItem) -> Optional[PriceData]:
+            domain = result.domain.replace("www.", "")
+            if domain not in domain_sems:
+                domain_sems[domain] = asyncio.Semaphore(domain_limit)
+                
+            async with global_sem:
+                async with domain_sems[domain]:
+                    try:
+                        adapter = adapter_registry.get_adapter(result.url)
+                        if not adapter:
+                            logger.warning(f"No adapter could handle {result.url}")
+                            return None
+                            
+                        # Apply timeout to extraction
+                        product = await asyncio.wait_for(
+                            adapter.extract_product(result.url), 
+                            timeout=timeout_sec
+                        )
+                        
+                        if product and product.price:
+                            platform_name = result.metadata.get("platform_name") or domain.split(".")[0].title()
+
+                            return PriceData(
+                                platform=PlatformInfo(
+                                    name=platform_name,
+                                    domain=domain,
+                                ),
+                                url=result.url,
+                                price=product.price,
+                                mrp=product.mrp,
+                                discount_pct=product.discount_pct,
+                                shipping=product.shipping,
+                                shipping_note="Free" if product.shipping == 0 else ("Unknown" if product.shipping is None else f"₹{product.shipping}"),
+                                effective_price=product.effective_price,
+                                currency=product.currency,
+                                availability=product.availability,
+                                seller=product.seller,
+                                fulfilled_by=product.fulfilled_by,
+                                condition=product.condition,
+                                title=product.title,
+                                external_product_id=product.external_id,
+                            )
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Price extraction timed out for {result.url}")
+                    except Exception as e:
+                        logger.warning(f"Price extraction failed for {result.url}: {e}")
+                    return None
 
         tasks = [extract_price(r) for r in product_results]
         results = await asyncio.gather(*tasks, return_exceptions=True)

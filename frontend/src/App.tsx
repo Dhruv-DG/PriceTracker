@@ -28,19 +28,18 @@ function App() {
     setSearchResult(null);
     setLoadingStep(0);
 
-    // Simulate progressive loading steps
-    const stepTimers = [
-      setTimeout(() => setLoadingStep(1), 300),
-      setTimeout(() => setLoadingStep(2), 800),
-      setTimeout(() => setLoadingStep(3), 1500),
-      setTimeout(() => setLoadingStep(4), 2200),
-      setTimeout(() => setLoadingStep(5), 2800),
-    ];
-
     try {
       const result = await api.search(query);
       setSearchResult(result);
-      setLoadingStep(6);
+      
+      // If we only have partial results, we need to poll for completion
+      if (result.status === 'ENRICHING' && result.search_id) {
+        setLoadingStep(3);
+        pollSearchStatus(result.search_id);
+      } else {
+        setLoadingStep(6);
+        setIsLoading(false);
+      }
 
       // Scroll to dashboard
       setTimeout(() => {
@@ -48,10 +47,34 @@ function App() {
       }, 100);
     } catch (err: any) {
       setError(err.message || 'Search failed. Please check if the backend is running.');
-    } finally {
-      stepTimers.forEach(clearTimeout);
       setIsLoading(false);
     }
+  }, []);
+
+  const pollSearchStatus = useCallback((searchId: number) => {
+    let attempts = 0;
+    const interval = setInterval(async () => {
+      try {
+        attempts++;
+        if (attempts > 60) { // 90 seconds timeout
+          clearInterval(interval);
+          setIsLoading(false);
+          return;
+        }
+        
+        const statusRes = await api.getSearchStatus(searchId);
+        
+        if (statusRes.completed && statusRes.dashboard) {
+          clearInterval(interval);
+          setSearchResult(prev => prev ? { ...prev, dashboard: statusRes.dashboard, status: 'COMPLETED' } : null);
+          setLoadingStep(6);
+          setIsLoading(false);
+        }
+      } catch (err) {
+        console.error("Polling error:", err);
+        // Don't stop polling on single error, might be transient
+      }
+    }, 1500);
   }, []);
 
   const dashboard = searchResult?.dashboard;
@@ -99,8 +122,8 @@ function App() {
         </div>
       )}
 
-      {/* Dashboard */}
-      {dashboard && searchResult?.product && (
+      {/* Dashboard container starts as soon as we have a product */}
+      {searchResult?.product && (
         <div ref={dashboardRef}>
           {/* Product Header */}
           <ProductHeader
@@ -109,41 +132,56 @@ function App() {
             latencyMs={searchResult.latency_ms}
           />
 
-          {/* Highlight Cards */}
-          <HighlightCardsComponent highlights={dashboard.highlights} />
+          {/* Current Prices Table is available immediately */}
+          {searchResult.current_prices && searchResult.current_prices.length > 0 && (
+            <PriceTable prices={searchResult.current_prices} />
+          )}
+          
+          {/* While history is loading, show a banner */}
+          {searchResult.status === 'ENRICHING' && (
+            <div style={{ padding: '20px', textAlign: 'center', background: 'var(--color-bg-alt)', borderRadius: '8px', margin: '20px 0', border: '1px solid var(--color-border)' }}>
+              <div className="loading-spinner" style={{ display: 'inline-block', width: '20px', height: '20px', border: '2px solid var(--color-primary)', borderTopColor: 'transparent', borderRadius: '50%', animation: 'spin 1s linear infinite' }} />
+              <span style={{ marginLeft: '10px' }}>Loading historical data and analytics...</span>
+            </div>
+          )}
 
-          {/* Current Prices Table */}
-          <PriceTable prices={dashboard.current_prices} />
+          {/* Full Dashboard (requires history/analytics) */}
+          {dashboard && (
+            <>
+              {/* Highlight Cards */}
+              <HighlightCardsComponent highlights={dashboard.highlights} />
 
-          {/* Price History Chart */}
-          <PriceHistoryChart platformHistories={dashboard.platform_histories} />
+              {/* Price History Chart */}
+              <PriceHistoryChart platformHistories={dashboard.platform_histories} />
 
-          {/* Average Price Over Time */}
-          <AveragePriceChart data={dashboard.average_price_over_time} />
+              {/* Average Price Over Time */}
+              <AveragePriceChart data={dashboard.average_price_over_time} />
 
-          {/* Price Movements */}
-          <PriceMovements movements={dashboard.price_movements} />
+              {/* Price Movements */}
+              <PriceMovements movements={dashboard.price_movements} />
 
-          {/* Statistics & Volatility */}
-          <PriceStats
-            currentStats={dashboard.current_statistics}
-            historicalStats={dashboard.historical_statistics}
-            volatility={dashboard.volatility}
-          />
+              {/* Statistics & Volatility */}
+              <PriceStats
+                currentStats={dashboard.current_statistics}
+                historicalStats={dashboard.historical_statistics}
+                volatility={dashboard.volatility}
+              />
 
-          {/* Price Position Indicator */}
-          <PricePositionIndicator position={dashboard.price_position} />
+              {/* Price Position Indicator */}
+              <PricePositionIndicator position={dashboard.price_position} />
 
-          {/* Where is it cheapest? */}
-          <CheapestInfo
-            cheapestCurrent={dashboard.cheapest_platform}
-            cheapestHistorical={dashboard.cheapest_historical_platform}
-            mostConsistent={dashboard.most_consistent_platform}
-            mostConsistentMetric={dashboard.most_consistent_metric}
-          />
+              {/* Where is it cheapest? */}
+              <CheapestInfo
+                cheapestCurrent={dashboard.cheapest_platform}
+                cheapestHistorical={dashboard.cheapest_historical_platform}
+                mostConsistent={dashboard.most_consistent_platform}
+                mostConsistentMetric={dashboard.most_consistent_metric}
+              />
 
-          {/* Data Sources */}
-          <DataSources sources={dashboard.data_sources} />
+              {/* Data Sources */}
+              <DataSources sources={dashboard.data_sources} />
+            </>
+          )}
 
           {/* Track Button */}
           <div className="track-section">

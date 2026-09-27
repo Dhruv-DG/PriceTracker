@@ -30,6 +30,10 @@ class ApiService {
     });
   }
 
+  async getSearchStatus(searchId: number): Promise<any> {
+    return this.request<any>(`/search/${searchId}/status`);
+  }
+
   async healthCheck(): Promise<HealthResponse> {
     return this.request<HealthResponse>('/health');
   }

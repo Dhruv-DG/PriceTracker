@@ -195,6 +195,8 @@ export interface SearchResponse {
   parsed_query: ParsedQuery | null;
   product: ProductInfo | null;
   dashboard: DashboardResponse | null;
+  current_prices: PriceData[];
+  status: string;
   is_demo: boolean;
   latency_ms: number | null;
   errors: string[];

@@ -258,10 +258,22 @@ class SearchResponse(BaseModel):
     parsed_query: Optional[ParsedQuery] = None
     product: Optional[ProductInfo] = None
     dashboard: Optional[DashboardResponse] = None
+    current_prices: List[PriceData] = []
+    status: str = "COMPLETED"
     is_demo: bool = False
     latency_ms: Optional[float] = None
     errors: List[str] = []
     warnings: List[str] = []
+
+
+class SearchStatusResponse(BaseModel):
+    """Response from a search status check."""
+    status: str
+    current_prices_ready: bool = False
+    history_ready: bool = False
+    analytics_ready: bool = False
+    completed: bool = False
+    dashboard: Optional[DashboardResponse] = None
 
 
 # ─── Tracking ────────────────────────────────────────────
