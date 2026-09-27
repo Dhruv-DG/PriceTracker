@@ -5,7 +5,7 @@ import {
 } from 'recharts';
 import { TrendingUp } from 'lucide-react';
 import type { PlatformHistory } from '../types';
-import { getPlatformColor } from '../types';
+import { getPlatformColor } from '../utils/theme';
 import { formatPrice, formatShortDate } from '../utils/format';
 
 interface PriceHistoryChartProps {

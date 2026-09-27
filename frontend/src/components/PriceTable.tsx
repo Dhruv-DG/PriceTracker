@@ -1,7 +1,7 @@
 import React from 'react';
 import { ShoppingCart, ExternalLink } from 'lucide-react';
 import type { PriceData } from '../types';
-import { getPlatformColor } from '../types';
+import { getPlatformColor } from '../utils/theme';
 import { formatPrice, formatPct, formatTimeAgo } from '../utils/format';
 
 interface PriceTableProps {

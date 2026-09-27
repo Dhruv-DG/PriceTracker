@@ -42,6 +42,14 @@ async def lifespan(app: FastAPI):
     own_db_provider = OwnDatabaseProvider(async_session)
     history_registry.register(own_db_provider)
     history_registry.set_fallback(own_db_provider)
+    
+    # Add Keepa first for Amazon if configured
+    if settings.KEEPA_API_KEY:
+        from app.history.keepa import KeepaProvider
+        keepa_provider = KeepaProvider()
+        keepa_provider.priority = 10
+        history_registry.register(keepa_provider)
+        
     logger.info("History registry initialized")
 
     # Initialize Adapter Registry
@@ -88,10 +96,14 @@ app.include_router(tracking_router)
 @app.get("/api/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
+    history_provider = "demo" if settings.is_demo_mode else "own_database"
+    if settings.KEEPA_API_KEY and not settings.is_demo_mode:
+        history_provider = "keepa+own_database"
+        
     providers = {
         "search": "serper" if settings.SERPER_API_KEY else "demo",
         "llm": "gemini" if settings.GEMINI_API_KEY else "rule-based",
-        "history": "demo" if settings.is_demo_mode else "own_database",
+        "history": history_provider,
     }
 
     return HealthResponse(

@@ -110,38 +110,54 @@ class AnalyticsService:
         """Compute price volatility metrics."""
         all_prices = []
         daily_changes = []
+        pct_changes = []
 
         for ph in platform_histories:
             obs = sorted(ph.history.observations, key=lambda o: o.date)
             prices = [o.price for o in obs]
             all_prices.extend(prices)
 
-            # Calculate daily changes
+            # Calculate daily percentage changes and raw changes
             for i in range(1, len(prices)):
                 change = prices[i] - prices[i - 1]
                 if prices[i - 1] != 0:
+                    pct_change = change / prices[i - 1]
                     daily_changes.append(change)
+                    pct_changes.append(pct_change)
 
         if not all_prices or len(all_prices) < 2:
             return VolatilityInfo()
 
         std_dev = statistics.stdev(all_prices)
         mean_price = statistics.mean(all_prices)
-        pct_volatility = round((std_dev / mean_price) * 100, 2) if mean_price else None
+        
+        # Volatility is now the standard deviation of percentage changes
+        pct_volatility = None
+        if len(pct_changes) > 1:
+            pct_volatility = round(statistics.stdev(pct_changes) * 100, 2)
 
-        # Classify volatility
-        if pct_volatility and pct_volatility < 3:
-            level = "Low"
-        elif pct_volatility and pct_volatility < 8:
-            level = "Medium"
+        # Classify volatility based on standard deviation of percentage changes
+        if pct_volatility is not None:
+            if pct_volatility < 2.0:
+                level = "Low"
+            elif pct_volatility < 5.0:
+                level = "Medium"
+            else:
+                level = "High"
         else:
-            level = "High"
+            level = "Unknown"
 
         # Find largest drop and increase
         largest_drop = min(daily_changes) if daily_changes else None
         largest_increase = max(daily_changes) if daily_changes else None
-        largest_drop_pct = round((largest_drop / mean_price) * 100, 1) if largest_drop and mean_price else None
-        largest_increase_pct = round((largest_increase / mean_price) * 100, 1) if largest_increase and mean_price else None
+        
+        largest_drop_pct = None
+        if pct_changes:
+            largest_drop_pct = round(min(pct_changes) * 100, 1)
+            
+        largest_increase_pct = None
+        if pct_changes:
+            largest_increase_pct = round(max(pct_changes) * 100, 1)
 
         return VolatilityInfo(
             level=level,
@@ -294,18 +310,21 @@ class AnalyticsService:
         self,
         platform_histories: List[PlatformHistory]
     ) -> tuple[Optional[str], Optional[str]]:
-        """Find the platform with lowest price variance."""
-        platform_variance = {}
+        """Find the platform with lowest coefficient of variation (normalized price variability)."""
+        platform_cv = {}
         for ph in platform_histories:
             if ph.history.observations and len(ph.history.observations) > 1:
                 prices = [o.price for o in ph.history.observations]
-                platform_variance[ph.platform.name] = statistics.variance(prices)
+                mean_price = statistics.mean(prices)
+                if mean_price > 0:
+                    cv = statistics.stdev(prices) / mean_price
+                    platform_cv[ph.platform.name] = cv
 
-        if not platform_variance:
+        if not platform_cv:
             return None, None
 
-        most_consistent = min(platform_variance, key=platform_variance.get)
-        return most_consistent, "Lowest price variance"
+        most_consistent = min(platform_cv, key=platform_cv.get)
+        return most_consistent, "Lowest price variability (CV)"
 
     def build_data_sources(
         self,

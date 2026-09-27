@@ -128,7 +128,7 @@ class PriceTracker:
                         job.status = TrackingStatus.ERROR.value
                         
                 await session.commit()
-                logger.info("Tracking cycle complete")
+                logger.info(f"tracking_run: completed jobs_processed={len(jobs_to_run)}")
                 
         except Exception as e:
             logger.error(f"Tracking cycle failed: {e}", exc_info=True)

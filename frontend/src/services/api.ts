@@ -34,13 +34,13 @@ class ApiService {
     return this.request<HealthResponse>('/health');
   }
 
-  async startTracking(productId: number, frequencyMinutes: number = 360): Promise<any> {
-    return this.request('/tracking', {
+  async startTracking(productName: string, frequencyMinutes: number = 360): Promise<any> {
+    const params = new URLSearchParams({
+      product_name: productName,
+      frequency_minutes: frequencyMinutes.toString(),
+    });
+    return this.request(`/tracking?${params.toString()}`, {
       method: 'POST',
-      body: JSON.stringify({
-        product_id: productId,
-        frequency_minutes: frequencyMinutes,
-      }),
     });
   }
 }

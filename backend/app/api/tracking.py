@@ -15,15 +15,15 @@ router = APIRouter(prefix="/api/tracking", tags=["tracking"])
 
 
 @router.post("")
-async def start_tracking(product_id: int, frequency_minutes: int = 360, db: AsyncSession = Depends(get_db)):
-    """Start tracking all listings for a product."""
+async def start_tracking(product_name: str, frequency_minutes: int = 360, db: AsyncSession = Depends(get_db)):
+    """Start tracking all listings for a product by its canonical name."""
     # Find all listings for this product
-    stmt = select(ProductListing).where(ProductListing.product_id == product_id)
+    stmt = select(ProductListing).join(Product).where(Product.canonical_name == product_name)
     result = await db.execute(stmt)
     listings = result.scalars().all()
     
     if not listings:
-        raise HTTPException(status_code=404, detail="Product or listings not found")
+        raise HTTPException(status_code=404, detail="Product or listings not found. Search for it first so it is saved in the database.")
         
     jobs_created = 0
     for listing in listings:

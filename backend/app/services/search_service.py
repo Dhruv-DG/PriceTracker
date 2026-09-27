@@ -59,10 +59,11 @@ class SearchOrchestrator:
         start_time = time.time()
         errors = []
         warnings = []
+        
+        logger.info(f"search_started: query='{request.query}'")
 
         try:
             # Step 1: Parse the query
-            logger.info(f"Parsing query: {request.query}")
             parsed_query = await llm_service.parse_query(request.query)
             logger.info(f"Parsed query: {parsed_query}")
 
@@ -76,7 +77,7 @@ class SearchOrchestrator:
             # Step 3: Search for products
             search_query = parsed_query.search_query or request.query
             search_results = await self.search_provider.search(search_query)
-            logger.info(f"Got {len(search_results)} search results")
+            logger.info(f"candidate_count: {len(search_results)}")
 
             if not search_results:
                 warnings.append("No search results found")
@@ -90,7 +91,7 @@ class SearchOrchestrator:
 
             # Step 4: Filter and classify results
             product_results = await self._filter_results(search_results, parsed_query)
-            logger.info(f"Filtered to {len(product_results)} product results")
+            logger.info(f"candidate_matched: {len(product_results)}")
 
             # Step 5: Build product info
             product = self._build_product_info(parsed_query, request.query)
@@ -137,6 +138,7 @@ class SearchOrchestrator:
             # Cache the result
             await search_cache.set(cache_key, response, settings.CACHE_TTL_SEARCH)
 
+            logger.info(f"search_completed: query='{request.query}', latency={latency}ms")
             return response
 
         except Exception as e:
@@ -188,6 +190,8 @@ class SearchOrchestrator:
 
         # For real mode, extract prices concurrently
         from app.adapters.registry import adapter_registry
+        
+        logger.info(f"price_fetch_started: count={len(product_results)}")
 
         async def extract_price(result: SearchResultItem) -> Optional[PriceData]:
             try:
@@ -235,6 +239,7 @@ class SearchOrchestrator:
             elif isinstance(r, Exception):
                 logger.warning(f"Price extraction error: {r}")
 
+        logger.info(f"price_fetch_completed: fetched={len(prices)}")
         return sorted(prices, key=lambda p: p.effective_price)
 
     def _get_demo_prices(
@@ -289,6 +294,7 @@ class SearchOrchestrator:
                 else:
                     provider = await self.history_registry.get_provider(price.platform.domain)
                     
+                logger.info(f"history_provider_used: platform={price.platform.domain} provider={provider.name}")
                 history = await provider.get_history(
                     product_identifier=product.canonical_name,
                     platform_domain=price.platform.domain,
@@ -303,7 +309,7 @@ class SearchOrchestrator:
                         historical_avg=round(sum(obs_prices) / len(obs_prices), 2),
                     )
             except Exception as e:
-                logger.warning(f"History retrieval failed for {price.platform.domain}: {e}")
+                logger.warning(f"history_provider_failed: platform={price.platform.domain} error={str(e)}")
             return None
 
         tasks = [get_history(p) for p in current_prices]
@@ -398,6 +404,7 @@ class SearchOrchestrator:
     async def _save_observations_to_db(self, product_info: ProductInfo, current_prices: List[PriceData]):
         """Persist product, platforms, listings, and price observations to the database."""
         try:
+            logger.info(f"database_write: start product={product_info.canonical_name} prices={len(current_prices)}")
             from sqlalchemy import select
             async with async_session() as session:
                 # 1. Get or create Product

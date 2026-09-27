@@ -31,14 +31,8 @@ class Base(DeclarativeBase):
 
 
 async def init_db():
-    """Create all tables."""
-    async with engine.begin() as conn:
-        from app.models.models import (
-            Product, Platform, ProductListing,
-            PriceObservation, HistoricalSource,
-            Search, SearchResult, TrackingJob, PriceAlert
-        )
-        await conn.run_sync(Base.metadata.create_all)
+    """Database initialization is now managed by Alembic."""
+    pass
 
 
 async def get_db() -> AsyncSession:

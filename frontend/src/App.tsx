@@ -147,7 +147,17 @@ function App() {
 
           {/* Track Button */}
           <div className="track-section">
-            <button className="track-btn" onClick={() => alert('Tracking will be enabled in the next update!')}>
+            <button 
+              className="track-btn" 
+              onClick={async () => {
+                try {
+                  const res = await api.startTracking(searchResult.product!.canonical_name);
+                  alert(`Tracking started! ${res.jobs_created_or_updated} product listings will be checked every ${res.frequency_minutes} minutes.`);
+                } catch (err: any) {
+                  alert(`Failed to start tracking: ${err.message}`);
+                }
+              }}
+            >
               <Zap size={18} />
               Track This Product
             </button>
