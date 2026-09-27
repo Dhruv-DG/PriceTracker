@@ -34,10 +34,32 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("Database initialized")
 
+    # Initialize History Registry
+    from app.history.registry import history_registry
+    from app.history.own_database import OwnDatabaseProvider
+    from app.database import async_session
+    
+    own_db_provider = OwnDatabaseProvider(async_session)
+    history_registry.register(own_db_provider)
+    history_registry.set_fallback(own_db_provider)
+    logger.info("History registry initialized")
+
+    # Initialize Adapter Registry
+    from app.adapters.registry import adapter_registry
+    from app.adapters.generic import GenericAdapter
+    adapter_registry.set_fallback(GenericAdapter())
+    logger.info("Adapter registry initialized")
+    
+    # Start background worker
+    from app.workers import PriceTracker
+    app.state.tracker = PriceTracker()
+    await app.state.tracker.start()
+
     yield
 
     # Shutdown
     logger.info("Shutting down...")
+    await app.state.tracker.stop()
 
 
 # Create FastAPI app

@@ -22,7 +22,10 @@ from app.adapters.demo import DemoAdapter, DEMO_PLATFORMS
 from app.search.serper import SerperSearchProvider
 from app.search.demo import DemoSearchProvider
 from app.history.demo import DemoHistoricalProvider
+from app.history.registry import history_registry
 from app.cache import search_cache, price_cache, make_cache_key
+from app.database import async_session
+from app.models.models import Product, Platform, ProductListing, PriceObservation, SourceType
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +43,11 @@ class SearchOrchestrator:
             self.search_provider = DemoSearchProvider()
             self.history_provider = DemoHistoricalProvider()
             self.demo_adapter = DemoAdapter()
+            self.history_registry = None
         else:
             self.search_provider = SerperSearchProvider()
-            self.history_provider = DemoHistoricalProvider()  # Fallback
+            self.history_provider = None
+            self.history_registry = history_registry
             self.demo_adapter = None
 
             # Try real search, fallback to demo
@@ -114,6 +119,10 @@ class SearchOrchestrator:
             latency = round((time.time() - start_time) * 1000, 1)
             dashboard.latency_ms = latency
 
+            # Step 9: Persist to database if not in demo mode
+            if not settings.is_demo_mode and current_prices:
+                asyncio.create_task(self._save_observations_to_db(product, current_prices))
+
             response = SearchResponse(
                 query=request.query,
                 parsed_query=parsed_query,
@@ -178,12 +187,16 @@ class SearchOrchestrator:
             return self._get_demo_prices(product_results, original_query)
 
         # For real mode, extract prices concurrently
-        from app.adapters.generic import GenericAdapter
-        generic = GenericAdapter()
+        from app.adapters.registry import adapter_registry
 
         async def extract_price(result: SearchResultItem) -> Optional[PriceData]:
             try:
-                product = await generic.extract_product(result.url)
+                adapter = adapter_registry.get_adapter(result.url)
+                if not adapter:
+                    logger.warning(f"No adapter could handle {result.url}")
+                    return None
+                    
+                product = await adapter.extract_product(result.url)
                 if product and product.price:
                     domain = result.domain.replace("www.", "")
                     platform_name = result.metadata.get("platform_name") or domain.split(".")[0].title()
@@ -271,7 +284,12 @@ class SearchOrchestrator:
         """Get historical data for all platforms concurrently."""
         async def get_history(price: PriceData) -> Optional[PlatformHistory]:
             try:
-                history = await self.history_provider.get_history(
+                if settings.is_demo_mode:
+                    provider = self.history_provider
+                else:
+                    provider = await self.history_registry.get_provider(price.platform.domain)
+                    
+                history = await provider.get_history(
                     product_identifier=product.canonical_name,
                     platform_domain=price.platform.domain,
                 )
@@ -376,6 +394,82 @@ class SearchOrchestrator:
             most_consistent_platform=most_consistent,
             most_consistent_metric=metric,
         )
+
+    async def _save_observations_to_db(self, product_info: ProductInfo, current_prices: List[PriceData]):
+        """Persist product, platforms, listings, and price observations to the database."""
+        try:
+            from sqlalchemy import select
+            async with async_session() as session:
+                # 1. Get or create Product
+                stmt = select(Product).where(Product.canonical_name == product_info.canonical_name)
+                result = await session.execute(stmt)
+                product = result.scalar_one_or_none()
+                
+                if not product:
+                    product = Product(
+                        canonical_name=product_info.canonical_name,
+                        brand=product_info.brand,
+                        model=product_info.model,
+                        variant=product_info.variant,
+                        category=product_info.category,
+                    )
+                    session.add(product)
+                    await session.flush()
+
+                # 2. Process each price data point
+                for price_data in current_prices:
+                    # Get or create Platform
+                    stmt = select(Platform).where(Platform.domain == price_data.platform.domain)
+                    result = await session.execute(stmt)
+                    platform = result.scalar_one_or_none()
+                    
+                    if not platform:
+                        platform = Platform(
+                            name=price_data.platform.name,
+                            domain=price_data.platform.domain,
+                        )
+                        session.add(platform)
+                        await session.flush()
+                        
+                    # Get or create ProductListing
+                    stmt = select(ProductListing).where(
+                        ProductListing.product_id == product.id,
+                        ProductListing.platform_id == platform.id
+                    )
+                    result = await session.execute(stmt)
+                    listing = result.scalar_one_or_none()
+                    
+                    if not listing:
+                        listing = ProductListing(
+                            product_id=product.id,
+                            platform_id=platform.id,
+                            url=price_data.url,
+                            title=price_data.title,
+                            seller=price_data.seller,
+                            external_product_id=price_data.external_product_id,
+                        )
+                        session.add(listing)
+                        await session.flush()
+                        
+                    # Add PriceObservation
+                    observation = PriceObservation(
+                        listing_id=listing.id,
+                        price=price_data.price,
+                        mrp=price_data.mrp,
+                        shipping=price_data.shipping,
+                        effective_price=price_data.effective_price,
+                        currency=price_data.currency,
+                        source="live_search",
+                        source_type=SourceType.OWN_TRACKER.value,
+                        provider="serper_extraction",
+                        confidence=1.0,
+                    )
+                    session.add(observation)
+                
+                await session.commit()
+                logger.info(f"Saved {len(current_prices)} observations for {product_info.canonical_name} to DB")
+        except Exception as e:
+            logger.error(f"Error saving observations to DB: {e}", exc_info=True)
 
 
 # Global orchestrator instance
