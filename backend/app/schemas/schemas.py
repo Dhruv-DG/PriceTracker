@@ -91,12 +91,12 @@ class PriceData(BaseModel):
     platform: PlatformInfo
     listing_id: Optional[int] = None
     url: str
-    price: float
+    price: Optional[float] = None
     mrp: Optional[float] = None
     discount_pct: Optional[float] = None
     shipping: Optional[float] = None
     shipping_note: str = "Unknown"
-    effective_price: float
+    effective_price: Optional[float] = None
     currency: str = "INR"
     availability: str = "available"
     seller: Optional[str] = None

@@ -1,7 +1,7 @@
 import React from 'react';
 import {
-  Activity, TrendingDown, TrendingUp, ArrowRight, BarChart2,
-  Database, Crosshair, Bell, Info
+  Activity, BarChart2,
+  Database, Crosshair, Info
 } from 'lucide-react';
 import type {
   PriceMovement, PriceStatistics, VolatilityInfo,

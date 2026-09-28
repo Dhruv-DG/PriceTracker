@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { AlertTriangle, Zap } from 'lucide-react';
 import { SearchBox } from './components/SearchBox';
 import { LoadingOverlay } from './components/LoadingOverlay';

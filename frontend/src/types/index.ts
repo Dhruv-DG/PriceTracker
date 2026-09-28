@@ -43,12 +43,12 @@ export interface PriceData {
   platform: PlatformInfo;
   listing_id: number | null;
   url: string;
-  price: number;
+  price: number | null;
   mrp: number | null;
   discount_pct: number | null;
   shipping: number | null;
   shipping_note: string;
-  effective_price: number;
+  effective_price: number | null;
   currency: string;
   availability: string;
   seller: string | null;

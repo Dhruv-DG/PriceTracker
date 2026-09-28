@@ -1,5 +1,4 @@
 import React from 'react';
-import { Tag } from 'lucide-react';
 import type { ProductInfo } from '../types';
 
 interface ProductHeaderProps {
@@ -8,7 +7,7 @@ interface ProductHeaderProps {
   latencyMs: number | null;
 }
 
-export const ProductHeader: React.FC<ProductHeaderProps> = ({ product, isDemo, latencyMs }) => {
+export const ProductHeader: React.FC<ProductHeaderProps> = ({ product, latencyMs }) => {
   const tags = [
     product.brand,
     product.storage,

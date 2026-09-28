@@ -68,13 +68,15 @@ class AnalyticsService:
 
         historical_avg = round(statistics.mean(all_hist_prices), 2) if all_hist_prices else None
 
-        # Current vs historical comparisons
+        # Current vs historical comparisons (§12: use mathematically consistent naming)
         current_vs_hist_avg = None
         current_vs_hist_low = None
-        if current_lowest and historical_avg:
+        # "vs Historical Avg" = current_average vs historical_avg
+        if current_average and historical_avg:
             current_vs_hist_avg = round(
-                ((current_lowest.effective_price - historical_avg) / historical_avg) * 100, 1
+                ((current_average - historical_avg) / historical_avg) * 100, 1
             )
+        # "vs Historical Low" = current_lowest vs hist_low
         if current_lowest and hist_low:
             current_vs_hist_low = round(
                 ((current_lowest.effective_price - hist_low) / hist_low) * 100, 1
@@ -195,7 +197,7 @@ class AnalyticsService:
         ]
 
         if not current_avg:
-            return [PriceMovement(period=p, direction="stable") for p, _ in periods]
+            return [PriceMovement(period=p, direction="no_data") for p, _ in periods]
 
         now = datetime.utcnow()
         movements = []
@@ -223,9 +225,10 @@ class AnalyticsService:
                     direction=direction,
                 ))
             else:
+                # No historical data for this period — distinct from 'stable' (§29)
                 movements.append(PriceMovement(
                     period=period_name,
-                    direction="stable"
+                    direction="no_data"
                 ))
 
         return movements

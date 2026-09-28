@@ -266,7 +266,11 @@ class SearchOrchestrator:
         )
 
     def _build_provisional_prices(self, results: List[SearchResultItem]) -> List[PriceData]:
-        """Convert initial SearchResultItems into provisional PriceData objects."""
+        """Convert initial SearchResultItems into provisional PriceData objects.
+        
+        Discovery prices from the search engine are stored as search_price.
+        price and effective_price use search_price as provisional until verified.
+        """
         prices = []
         for r in results:
             domain = r.domain.replace("www.", "")
@@ -284,13 +288,13 @@ class SearchOrchestrator:
                     raw_price = snippet_match.group(1)
 
             search_price = self._parse_price_string(raw_price) if raw_price else None
-            price_val = search_price if search_price else 0.0
             
+            # Use search_price as provisional display price — never fake 0.0
             p = PriceData(
                 platform=PlatformInfo(name=platform_name, domain=domain),
                 url=r.url,
-                price=price_val,
-                effective_price=price_val,
+                price=search_price,  # provisional — None if unknown
+                effective_price=search_price,  # provisional — None if unknown
                 title=r.title or None,
                 search_price=search_price,
                 verification_status="PENDING",
@@ -338,7 +342,6 @@ class SearchOrchestrator:
         # 1. Deterministic filtering first
         needs_llm = []
         filtered = []
-        seen_domains = set()
         
         # We need the product name to be at least partially present
         brand = (parsed_query.brand or "").lower()
@@ -347,10 +350,6 @@ class SearchOrchestrator:
         for r in unique_results:
             title = (r.title or "").lower()
             url = r.url.lower()
-            normalized_domain = r.domain.replace("www.", "")
-            
-            if normalized_domain in seen_domains:
-                continue
             
             # Fast reject: definitely not a product page (e.g. review, news, blog)
             if any(bad in url for bad in ["/review", "/news", "/blog", "forum", "/article"]):
@@ -373,7 +372,6 @@ class SearchOrchestrator:
                         r.match_confidence = "MEDIUM"
                         
                     filtered.append(r)
-                    seen_domains.add(normalized_domain)
                     continue
                     
             # For shopping results from serper, they are almost definitely products
@@ -382,13 +380,12 @@ class SearchOrchestrator:
                 r.relevance_score = 0.8
                 r.match_confidence = "HIGH" if (brand in title and model in title) else "MEDIUM"
                 filtered.append(r)
-                seen_domains.add(normalized_domain)
                 continue
             
             # Ambiguous: send to LLM or use rule-based fallback
             needs_llm.append(r)
 
-        # 2. If LLM is available, classify ambiguous results in a single batch. Otherwise, use generous rule-based.
+        # 2. If LLM is available, classify ambiguous results in a single batch. Otherwise, use rule-based.
         if needs_llm and not llm_service._circuit_open:
             try:
                 candidates_data = [
@@ -400,18 +397,13 @@ class SearchOrchestrator:
                 if len(batch_classifications) == len(needs_llm):
                     for idx, classification in enumerate(batch_classifications):
                         result = needs_llm[idx]
-                        domain_norm = result.domain.replace("www.", "")
                         
-                        if domain_norm in seen_domains:
-                            continue
-                            
                         # Strictly enforce that it must be an ecommerce platform
                         if classification.get("is_ecommerce") and classification.get("type") == "product_page":
                             result.is_product_page = True
                             result.relevance_score = classification.get("confidence", 0.5)
                             result.match_confidence = "MEDIUM" if result.relevance_score > 0.5 else "LOW"
                             filtered.append(result)
-                            seen_domains.add(domain_norm)
             except Exception as e:
                 logger.warning(f"Batch classification failed: {e}")
         elif needs_llm:
@@ -419,21 +411,17 @@ class SearchOrchestrator:
             KNOWN_ECOMMERCE = {
                 "amazon", "flipkart", "myntra", "ajio", "tatacliq", "croma",
                 "reliancedigital", "vijaysales", "poorvika", "apple", "samsung",
-                "jiomart", "snapdeal", "meesho", "paytmmall", "nykaa", "shopatsc"
+                "jiomart", "snapdeal", "meesho", "paytmmall", "nykaa", "shopatsc",
+                "indiaistore", "iplanet", "unicornstore",
             }
             for r in needs_llm:
-                domain_norm = r.domain.replace("www.", "")
-                if domain_norm in seen_domains:
-                    continue
-                    
-                domain_base = domain_norm.split(".")[0].lower()
+                domain_base = r.domain.replace("www.", "").split(".")[0].lower()
                 # Accept ONLY if it's a known e-commerce domain
                 if domain_base in KNOWN_ECOMMERCE:
                     r.is_product_page = True
                     r.relevance_score = 0.6
                     r.match_confidence = "LOW"
                     filtered.append(r)
-                    seen_domains.add(domain_norm)
 
         return filtered
 
@@ -519,7 +507,12 @@ class SearchOrchestrator:
                 logger.warning(f"Price extraction error: {r}")
 
         logger.info(f"price_fetch_completed: fetched={len(prices)}")
-        return sorted(prices, key=lambda p: p.effective_price)
+        # Sort: verified first, then by effective_price (None values last)
+        def sort_key(p: PriceData):
+            verified = 0 if p.verification_status == "VERIFIED" else 1
+            price = p.effective_price if p.effective_price is not None else float('inf')
+            return (verified, price)
+        return sorted(prices, key=sort_key)
 
     def _get_demo_prices(
         self,
@@ -648,14 +641,20 @@ class SearchOrchestrator:
         platform_histories: List[PlatformHistory],
     ) -> DashboardResponse:
         """Build the complete dashboard response."""
-        # Highlight cards
-        highlights = analytics_service.compute_highlights(current_prices, platform_histories)
+        # Separate verified prices for analytics vs all prices for display
+        verified_prices = [
+            p for p in current_prices 
+            if p.verification_status == "VERIFIED" and p.effective_price is not None and p.effective_price > 0
+        ]
+        
+        # Highlight cards — uses only verified prices
+        highlights = analytics_service.compute_highlights(verified_prices, platform_histories)
 
-        # Current statistics
+        # Current statistics — uses only verified prices
         current_stats = analytics_service.compute_statistics(
-            [p.effective_price for p in current_prices]
+            [p.effective_price for p in verified_prices]
         )
-        current_stats.platforms_count = len(current_prices)
+        current_stats.platforms_count = len(verified_prices)
 
         # Historical statistics
         all_hist_prices = []
@@ -685,13 +684,13 @@ class SearchOrchestrator:
         # Data sources
         data_sources = analytics_service.build_data_sources(platform_histories)
 
-        # Current cheapest platform
-        cheapest_current = current_prices[0].platform.name if current_prices else None
+        # Current cheapest platform — VERIFIED only (§32)
+        cheapest_current = verified_prices[0].platform.name if verified_prices else None
 
         return DashboardResponse(
             product=product,
             highlights=highlights,
-            current_prices=current_prices,
+            current_prices=current_prices,  # ALL prices for display (including unverified)
             platform_histories=platform_histories,
             average_price_over_time=avg_over_time,
             price_movements=movements,
@@ -707,10 +706,25 @@ class SearchOrchestrator:
         )
 
     async def _save_observations_to_db(self, product_info: ProductInfo, current_prices: List[PriceData]) -> Optional[int]:
-        """Persist product, platforms, listings, and price observations to the database.
+        """Persist product, platforms, listings, and VERIFIED price observations to the database.
+        
+        CRITICAL: Only observations that are VERIFIED with price > 0 are persisted
+        to the historical database. Unverified/failed/provisional prices must never
+        contaminate the historical record.
+        
         Returns the product ID. Raises exception on failure.
         """
-        logger.info(f"database_write: start product={product_info.canonical_name} prices={len(current_prices)}")
+        # Filter to only verified observations with valid prices
+        verified_prices = [
+            p for p in current_prices
+            if p.verification_status == "VERIFIED" and p.price is not None and p.price > 0
+        ]
+        
+        if not verified_prices:
+            logger.info(f"database_write: no verified prices to save for {product_info.canonical_name}")
+            return None
+            
+        logger.info(f"database_write: start product={product_info.canonical_name} verified={len(verified_prices)}/{len(current_prices)}")
         from sqlalchemy import select
         async with async_session() as session:
             try:
@@ -730,8 +744,9 @@ class SearchOrchestrator:
                     session.add(product)
                     await session.flush()
 
-                # 2. Process each price data point
-                for price_data in current_prices:
+                # 2. Process only VERIFIED price data points
+                saved_count = 0
+                for price_data in verified_prices:
                     # Get or create Platform
                     stmt = select(Platform).where(Platform.domain == price_data.platform.domain)
                     result = await session.execute(stmt)
@@ -776,7 +791,9 @@ class SearchOrchestrator:
                         session.add(listing)
                         await session.flush()
                         
-                    # Add PriceObservation
+                    # Add PriceObservation — only verified data reaches here
+                    # Confidence: use adapter extraction confidence, not hardcoded 1.0
+                    confidence = 0.9 if price_data.verified_price else 0.7
                     observation = PriceObservation(
                         listing_id=listing.id,
                         price=price_data.price,
@@ -786,13 +803,14 @@ class SearchOrchestrator:
                         currency=price_data.currency,
                         source="live_search",
                         source_type=SourceType.OWN_TRACKER.value,
-                        provider="serper_extraction",
-                        confidence=1.0,
+                        provider="adapter_extraction",
+                        confidence=confidence,
                     )
                     session.add(observation)
+                    saved_count += 1
                 
                 await session.commit()
-                logger.info(f"Saved {len(current_prices)} observations for {product_info.canonical_name} to DB")
+                logger.info(f"Saved {saved_count} verified observations for {product_info.canonical_name} to DB")
                 return product.id
             except Exception as e:
                 await session.rollback()
